@@ -1,0 +1,410 @@
+#!/usr/bin/env python3
+import argparse
+import logging
+import shlex
+import subprocess
+import sys
+from decimal import Decimal
+from pathlib import Path
+from tempfile import NamedTemporaryFile
+
+DEFAULT_MPDECIMATE_PARAMS = "frac=1:lo=512"
+DEFAULT_MIN_KEEP = 1
+DEFAULT_MIN_DROP = 5
+
+logger = logging.getLogger(__name__)
+
+parser = argparse.ArgumentParser(
+    description="Use ffmpeg's mpdecimate filter to find "
+    "static parts of the input video and cut them out precisely, "
+    "with or without reencoding."
+)
+parser.add_argument("input_file", type=Path, help="Input file")
+parser.add_argument(
+    "output_file",
+    nargs="?",
+    type=Path,
+    help="Output file (by default will prefix the input file with 'trimmed_')",
+)
+parser.add_argument(
+    "-y", "--yes", action="store_true", help="Overwrite files without asking first"
+)
+parser.add_argument(
+    "-v",
+    "--verbose",
+    action="count",
+    default=0,
+    help="Increase verbosity (can be specified multiple times)",
+)
+parser.add_argument(
+    "-p",
+    "--params",
+    default=DEFAULT_MPDECIMATE_PARAMS,
+    help=f"Custom mpdecimate settings (defaults to '{DEFAULT_MPDECIMATE_PARAMS}')",
+)
+parser.add_argument(
+    "--mode",
+    choices=("copy", "filter"),
+    default="copy",
+    help="Output mode: 'copy' for less precise fast encoding and no "
+    "quality loss (default), 'filter' for more precise cuts but with "
+    "full reencoding",
+)
+parser.add_argument(
+    "--encoding-params",
+    help="Additional encoding params. Only valid for the 'filter' mode",
+    type=shlex.split,
+)
+parser.add_argument(
+    "--stdin",
+    dest="from_stdin",
+    action="store_true",
+    help="Read mpdecimate output from stdin",
+)
+parser.add_argument(
+    "--min-keep",
+    help=f"Minimum non-static part length to keep (seconds, defaults to {DEFAULT_MIN_KEEP})",
+    type=Decimal,
+    default=DEFAULT_MIN_KEEP,
+)
+parser.add_argument(
+    "--min-drop",
+    help=f"Minimum static part length to drop (seconds, defaults to {DEFAULT_MIN_DROP})",
+    type=Decimal,
+    default=DEFAULT_MIN_DROP,
+)
+
+
+def call(*args, capture_output=False):
+    logger.debug("Running %s", args)
+
+    try:
+        return subprocess.run(
+            args,
+            text=True,
+            check=True,
+            capture_output=capture_output,
+        )
+    except FileNotFoundError as e:
+        raise RuntimeError("Unable to find the executable") from e
+    except subprocess.CalledProcessError as e:
+        if capture_output:
+            logger.error(e.stderr or e.stdout)
+        raise
+
+
+def _to_hms(value, prec=6):
+    hours, minutes = divmod(value, 3_600)
+    minutes, seconds = divmod(minutes, 60)
+    return f"{hours:02}:{minutes:02}:{seconds:0{prec + 2 + 1}.{prec}f}"
+
+
+def _get_mpdecimate_filter(args):
+    return f"mpdecimate={args.params}"
+
+
+def get_mpdecimate_output(args):
+    if args.from_stdin:
+        return sys.stdin.read()
+
+    return call(
+        "ffmpeg",
+        "-i",
+        args.input_file,
+        "-vf",
+        _get_mpdecimate_filter(args),
+        "-loglevel",
+        "debug",
+        "-f",
+        "null",
+        "-",
+        capture_output=True,
+    ).stderr
+
+
+def get_intervals(mpdecimate_output, *, min_drop, min_keep):
+    """
+    Parse mpdecimate output and return the intervals that should be kept.
+    Droppable parts less than `min_drop` seconds in length will NOT be dropped.
+    Intervals that are shorter than `min_keep` seconds will NOT be kept.
+    """
+    intervals = []
+
+    for line in mpdecimate_output.splitlines():
+        head, sep, tail = line.rpartition(" drop_count:")
+        if not sep:
+            continue
+
+        drop_count = int(tail)
+        _, _, tail = head.rpartition(" pts_time:")
+        pts_time = Decimal(tail)
+
+        if drop_count < 0:
+            if drop_count == -1:
+                if (
+                    not intervals
+                    or len(intervals[-1]) == 2
+                    and pts_time - intervals[-1][-1] > min_drop
+                ):
+                    intervals.append((pts_time,))
+            else:
+                intervals[-1] = (intervals[-1][0], pts_time)
+        elif drop_count == 1 and len(intervals[-1]) == 1:
+            intervals.pop()
+
+    if intervals and len(intervals[-1]) == 1:
+        intervals[-1] = (intervals[-1][0], None)
+
+    return [(s, e) for s, e in intervals if e is None or e - s >= min_keep]
+
+
+def align(intervals, *, keyframes):
+    """
+    Align intervals to the keyframes.
+    Interval start will be aligned to the preceding keyframe. Interval end will be
+    aligned to the following keyframe. If after alignment intervals would overlap,
+    they will be merged.
+    """
+    aligned_intervals = []
+    last_keyframe_index = 0
+
+    for start, end in intervals:
+        while last_keyframe_index < len(keyframes):
+            if start < keyframes[last_keyframe_index] and last_keyframe_index > 0:
+                start = keyframes[last_keyframe_index - 1]
+                break
+
+            last_keyframe_index += 1
+
+        while end is not None and last_keyframe_index < len(keyframes):
+            if end < keyframes[last_keyframe_index]:
+                end = keyframes[last_keyframe_index]
+                break
+
+            last_keyframe_index += 1
+
+        if aligned_intervals:
+            last_aligned_start, last_aligned_end = aligned_intervals[-1]
+            if last_aligned_end >= start:
+                aligned_intervals[-1] = (last_aligned_start, end)
+                continue
+
+        aligned_intervals.append((start, end))
+
+    return aligned_intervals
+
+
+def get_keyframes_output(args):
+    return call(
+        "ffprobe",
+        "-select_streams",
+        "v:0",
+        "-skip_frame",
+        "nokey",
+        "-show_entries",
+        "frame=pkt_pts_time",
+        "-of",
+        "csv=p=0",
+        args.input_file,
+        capture_output=True,
+    ).stdout
+
+
+def get_keyframes(keyframes_output):
+    return [Decimal(line) for line in keyframes_output.splitlines() if line]
+
+
+def write_complex_filter(intervals, *, file=None):
+    link_labels = ""
+
+    for counter, (start, end) in enumerate(intervals):
+        if end is not None:
+            trim_options = f"start={start:.6f}:end={end:.6f}"
+        else:
+            trim_options = f"start={start:.6f}"
+
+        vlink_label = f"[v{counter}]"
+        print(f"[0:v]trim={trim_options},setpts=PTS-STARTPTS{vlink_label};", file=file)
+        alink_label = f"[a{counter}]"
+        print(
+            f"[0:a]atrim={trim_options},asetpts=PTS-STARTPTS{alink_label};", file=file
+        )
+
+        link_labels += vlink_label
+        link_labels += alink_label
+
+    print(link_labels, end="", file=file)
+    print(f"concat=n={len(intervals)}:v=1:a=1[vout][aout]", file=file)
+
+
+def trim_by_copy(intervals, *, input_file, output_file, force, log_level):
+    parts = []
+
+    with NamedTemporaryFile("w+") as ff:
+        try:
+            for i, (start, end) in enumerate(intervals):
+                part = output_file.with_name(f"{i:02}.{output_file.name}")
+                logger.debug(
+                    "Part %d: path=%s, interval=[%s, %s]",
+                    i,
+                    part,
+                    _to_hms(start),
+                    end and _to_hms(end),
+                )
+                parts.append(part)
+
+                args = [
+                    "ffmpeg",
+                    "-accurate_seek",
+                    "-ss",
+                    _to_hms(start),
+                    "-loglevel",
+                    log_level,
+                ]
+
+                if end is not None:
+                    args.append("-to")
+                    args.append(_to_hms(end))
+
+                args += [
+                    "-copyts",
+                    "-i",
+                    input_file,
+                    "-c",
+                    "copy",
+                    part,
+                ]
+
+                if force:
+                    args.append("-y")
+
+                call(*args)
+                print(f"file '{part.resolve()}'", file=ff)
+
+            ff.flush()
+
+            concat_args = [
+                "ffmpeg",
+                "-f",
+                "concat",
+                "-safe",
+                "0",
+                "-i",
+                ff.name,
+                "-c",
+                "copy",
+                "-loglevel",
+                log_level,
+                output_file,
+            ]
+
+            if force:
+                concat_args.append("-y")
+
+            call(*concat_args)
+        finally:
+            for part in parts:
+                part.unlink(missing_ok=True)
+
+
+def trim_by_filter(
+    intervals, *, input_file, output_file, force, log_level, encoding_params
+):
+    with NamedTemporaryFile("w+") as ff:
+        logger.info("Writing filter file")
+        write_complex_filter(intervals, file=ff)
+        ff.flush()
+
+        args = [
+            "ffmpeg",
+            "-i",
+            input_file,
+            "-filter_complex_script",
+            ff.name,
+            *encoding_params,
+            "-map",
+            "[vout]",
+            "-map",
+            "[aout]",
+            "-loglevel",
+            log_level,
+        ]
+        if force:
+            args.append("-y")
+
+        args.append(output_file)
+        call(*args)
+
+
+def main(args):
+    if args.mode != "filter" and args.encoding_params is not None:
+        raise ValueError(
+            "--encoding-params argument is only compatible with 'filter' mode"
+        )
+
+    ffmpeg_log_level = "warning" if args.verbose < 1 else "info"
+
+    if args.output_file is None:
+        output_file = args.input_file.with_name(f"trimmed_{args.input_file.name}")
+    else:
+        output_file = args.output_file
+
+    intervals = get_intervals(
+        get_mpdecimate_output(args),
+        min_drop=args.min_drop,
+        min_keep=args.min_keep,
+    )
+    if not intervals:
+        raise RuntimeError("Nothing to keep")
+
+    if args.verbose >= 2:
+        for i, (start, end) in enumerate(intervals):
+            logger.debug(
+                "Raw interval #%d: [%s, %s]",
+                i,
+                _to_hms(start).rjust(16),
+                str(end and _to_hms(end)).rjust(16),
+            )
+
+    if args.mode == "copy":
+        keyframes = get_keyframes(get_keyframes_output(args))
+        aligned_intervals = align(intervals, keyframes=keyframes)
+
+        if args.verbose >= 2:
+            for i, (aligned_start, aligned_end) in enumerate(aligned_intervals):
+                logger.debug(
+                    "Aligned interval #%d: [%s, %s]",
+                    i,
+                    _to_hms(aligned_start).rjust(16),
+                    str(aligned_end and _to_hms(aligned_end)).rjust(16),
+                )
+
+        trim_by_copy(
+            aligned_intervals,
+            input_file=args.input_file,
+            output_file=output_file,
+            force=args.yes,
+            log_level=ffmpeg_log_level,
+        )
+    else:
+        trim_by_filter(
+            intervals,
+            input_file=args.input_file,
+            output_file=output_file,
+            force=args.yes,
+            log_level=ffmpeg_log_level,
+            encoding_params=args.encoding_params or [],
+        )
+
+
+if __name__ == "__main__":
+    args = parser.parse_args()
+    if args.verbose >= 2:
+        log_level = logging.DEBUG
+    elif args.verbose:
+        log_level = logging.INFO
+    else:
+        log_level = logging.WARNING
+
+    logging.basicConfig(level=log_level)
+    main(args)
