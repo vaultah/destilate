@@ -51,8 +51,13 @@ parser.add_argument(
     "full reencoding",
 )
 parser.add_argument(
-    "--encoding-params",
-    help="Additional encoding params. Only valid for the 'filter' mode",
+    "--args",
+    help="Additional ffmpeg arguments for the first step (mpdecimate invocation)",
+    type=shlex.split,
+)
+parser.add_argument(
+    "--encoding-args",
+    help="Additional ffmpeg arguments for the second step (trim). Only valid in the 'filter' mode",
     type=shlex.split,
 )
 parser.add_argument(
@@ -99,24 +104,18 @@ def _to_hms(value, prec=6):
     return f"{hours:02}:{minutes:02}:{seconds:0{prec + 2 + 1}.{prec}f}"
 
 
-def _get_mpdecimate_filter(args):
-    return f"mpdecimate={args.params}"
-
-
-def get_mpdecimate_output(args):
-    if args.from_stdin:
-        return sys.stdin.read()
-
+def get_mpdecimate_output(input_file, *, params, args):
     return call(
         "ffmpeg",
         "-i",
-        args.input_file,
+        input_file,
         "-vf",
-        _get_mpdecimate_filter(args),
+        f"mpdecimate={params}",
         "-loglevel",
         "debug",
         "-f",
         "null",
+        *args,
         "-",
         capture_output=True,
     ).stderr
@@ -152,7 +151,7 @@ def get_intervals(mpdecimate_output, *, min_drop, min_keep):
         elif drop_count == 1 and len(intervals[-1]) == 1:
             intervals.pop()
 
-    if intervals and len(intervals[-1]) == 1:
+    if intervals and (len(intervals[-1]) == 1 or intervals[-1][1] == pts_time):
         intervals[-1] = (intervals[-1][0], None)
 
     return [(s, e) for s, e in intervals if e is None or e - s >= min_keep]
@@ -308,7 +307,7 @@ def trim_by_copy(intervals, *, input_file, output_file, force, log_level):
 
 
 def trim_by_filter(
-    intervals, *, input_file, output_file, force, log_level, encoding_params
+    intervals, *, input_file, output_file, force, log_level, encoding_args
 ):
     with NamedTemporaryFile("w+") as ff:
         logger.info("Writing filter file")
@@ -321,7 +320,7 @@ def trim_by_filter(
             input_file,
             "-filter_complex_script",
             ff.name,
-            *encoding_params,
+            *encoding_args,
             "-map",
             "[vout]",
             "-map",
@@ -337,7 +336,7 @@ def trim_by_filter(
 
 
 def main(args):
-    if args.mode != "filter" and args.encoding_params is not None:
+    if args.mode != "filter" and args.encoding_args is not None:
         raise ValueError(
             "--encoding-params argument is only compatible with 'filter' mode"
         )
@@ -349,13 +348,23 @@ def main(args):
     else:
         output_file = args.output_file
 
+    if args.from_stdin:
+        mpdecimate_output = sys.stdin.read()
+    else:
+        mpdecimate_output = get_mpdecimate_output(
+            args.input_file, params=args.params, args=args.args or []
+        )
+
     intervals = get_intervals(
-        get_mpdecimate_output(args),
+        mpdecimate_output,
         min_drop=args.min_drop,
         min_keep=args.min_keep,
     )
+
     if not intervals:
         raise RuntimeError("Nothing to keep")
+    elif intervals == [(0, None)]:
+        raise RuntimeError("Nothing to remove")
 
     if args.verbose >= 2:
         for i, (start, end) in enumerate(intervals):
@@ -393,7 +402,7 @@ def main(args):
             output_file=output_file,
             force=args.yes,
             log_level=ffmpeg_log_level,
-            encoding_params=args.encoding_params or [],
+            encoding_args=args.encoding_args or [],
         )
 
 
