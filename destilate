@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 import argparse
 import logging
+import os
+import re
 import shlex
 import subprocess
 import sys
+from contextlib import contextmanager
 from decimal import Decimal
 from pathlib import Path
 from tempfile import NamedTemporaryFile
@@ -79,10 +82,21 @@ parser.add_argument(
     default=DEFAULT_MIN_DROP,
 )
 
+_mpdecimate_line_pattern = re.compile(
+    r" pts_time:(?P<pts_time>[^ ]+).*? drop_count:(?P<drop_count>[^ ]+)"
+)
 
-def call(*args, capture_output=False):
-    logger.debug("Running %s", args)
 
+def _to_hms(value, prec=6):
+    hours, minutes = divmod(value, 3_600)
+    minutes, seconds = divmod(minutes, 60)
+    return f"{hours:02}:{minutes:02}:{seconds:0{prec + 2 + 1}.{prec}f}"
+
+def _fmt_args(args):
+    return shlex.join(map(str, args))
+
+def _run(*args, capture_output=False):
+    logger.debug("Running %r", _fmt_args(args))
     try:
         return subprocess.run(
             args,
@@ -98,14 +112,30 @@ def call(*args, capture_output=False):
         raise
 
 
-def _to_hms(value, prec=6):
-    hours, minutes = divmod(value, 3_600)
-    minutes, seconds = divmod(minutes, 60)
-    return f"{hours:02}:{minutes:02}:{seconds:0{prec + 2 + 1}.{prec}f}"
+@contextmanager
+def _popen(*args):
+    logger.debug("Executing %r", _fmt_args(args))
+    try:
+        with subprocess.Popen(
+            args,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        ) as process:
+            yield process
+    except FileNotFoundError as e:
+        raise RuntimeError("Unable to find the executable") from e
+    else:
+        if process.returncode:
+            raise RuntimeError(
+                f"Error running command {_fmt_args(args)!r}: "
+                f"process exited with code {process.returncode}"
+            )
 
 
-def get_mpdecimate_output(input_file, *, params, args):
-    return call(
+@contextmanager
+def read_mpdecimate_output(input_file, *, params, args):
+    with _popen(
         "ffmpeg",
         "-i",
         input_file,
@@ -117,11 +147,11 @@ def get_mpdecimate_output(input_file, *, params, args):
         "null",
         *args,
         "-",
-        capture_output=True,
-    ).stderr
+    ) as process:
+        yield process.stdout
 
 
-def get_intervals(mpdecimate_output, *, min_drop, min_keep):
+def get_intervals(mpdecimate_lines, *, min_drop, min_keep):
     """
     Parse mpdecimate output and return the intervals that should be kept.
     Droppable parts less than `min_drop` seconds in length will NOT be dropped.
@@ -129,15 +159,12 @@ def get_intervals(mpdecimate_output, *, min_drop, min_keep):
     """
     intervals = []
 
-    for line in mpdecimate_output.splitlines():
-        head, sep, tail = line.rpartition(" drop_count:")
-        if not sep:
+    for line in mpdecimate_lines:
+        match = _mpdecimate_line_pattern.search(line)
+        if match is None:
             continue
 
-        drop_count = int(tail)
-        _, _, tail = head.rpartition(" pts_time:")
-        pts_time = Decimal(tail)
-
+        pts_time, drop_count = Decimal(match["pts_time"]), int(match["drop_count"])
         if drop_count < 0:
             if drop_count == -1:
                 if (
@@ -194,7 +221,7 @@ def align(intervals, *, keyframes):
 
 
 def get_keyframes_output(args):
-    return call(
+    return _run(
         "ffprobe",
         "-select_streams",
         "v:0",
@@ -277,7 +304,7 @@ def trim_by_copy(intervals, *, input_file, output_file, force, log_level):
                 if force:
                     args.append("-y")
 
-                call(*args)
+                _run(*args)
                 print(f"file '{part.resolve()}'", file=ff)
 
             ff.flush()
@@ -300,7 +327,7 @@ def trim_by_copy(intervals, *, input_file, output_file, force, log_level):
             if force:
                 concat_args.append("-y")
 
-            call(*concat_args)
+            _run(*concat_args)
         finally:
             for part in parts:
                 part.unlink(missing_ok=True)
@@ -332,7 +359,7 @@ def trim_by_filter(
             args.append("-y")
 
         args.append(output_file)
-        call(*args)
+        _run(*args)
 
 
 def main(args):
@@ -349,17 +376,16 @@ def main(args):
         output_file = args.output_file
 
     if args.from_stdin:
-        mpdecimate_output = sys.stdin.read()
-    else:
-        mpdecimate_output = get_mpdecimate_output(
-            args.input_file, params=args.params, args=args.args or []
+        intervals = get_intervals(
+            sys.stdin, min_drop=args.min_drop, min_keep=args.min_keep
         )
-
-    intervals = get_intervals(
-        mpdecimate_output,
-        min_drop=args.min_drop,
-        min_keep=args.min_keep,
-    )
+    else:
+        with read_mpdecimate_output(
+            args.input_file, params=args.params, args=args.args or []
+        ) as stdout:
+            intervals = get_intervals(
+                stdout, min_drop=args.min_drop, min_keep=args.min_keep
+            )
 
     if not intervals:
         raise RuntimeError("Nothing to keep")
